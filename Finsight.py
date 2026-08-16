@@ -1,35 +1,6 @@
 # finsight.py
 #
 # bloomberg-style financial research pipeline
-# architecture:
-#
-#   user question
-#       │
-#       ▼
-#   query router  ──── decides which engines to call
-#       │
-#       ├── financial metrics engine  ── python computes YoY, CAGR, margins
-#       ├── sec retriever             ── management commentary, risk, filings
-#       ├── news retriever            ── sentiment, catalysts, recent events
-#       └── price engine              ── price history chunks
-#       │
-#       ▼
-#   evidence verifier  ── rejects chunks with no financial numbers for metric queries
-#       │
-#       ▼
-#   context builder    ── assembles ranked evidence with citations
-#       │
-#       ▼
-#   qwen2.5 via ollama ── generates answer from grounded context only
-#       │
-#       ▼
-#   numeric validator  ── flags any % not present in context
-#       │
-#       ▼
-#   answer
-#
-# the llm is the last step, not the calculator.
-# python computes every financial ratio before the llm sees anything.
 
 import feedparser
 import html
