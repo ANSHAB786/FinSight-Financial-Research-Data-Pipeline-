@@ -15,7 +15,8 @@ import threading
 import time
 import unicodedata
 import yfinance as yf
-
+import hashlib
+import difflib
 from bs4 import BeautifulSoup
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -139,16 +140,38 @@ def clean(text: str) -> str:
         return ""
     text = html.unescape(text)
     text = unicodedata.normalize("NFKC", text)
+
+    # Normalize punctuation
     for src, dst in [("\u2014"," - "),("\u2013"," - "),("\u2018","'"),("\u2019","'"),("\u201c",'"'),("\u201d",'"')]:
         text = text.replace(src, dst)
+
+    # Remove control chars
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
-    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00ad]", "", text)
-    text = re.sub(r"\.{3,}", "...", text)
-    text = re.sub(r"-{3,}|_{3,}|\*{2,}", " ", text)
-    text = re.sub(r"(?<!\w)Page \d+(?!\w)", " ", text)
-    text = re.sub(r"(?<!\w)[♦•◦▪▸►](?!\w)", "\n- ", text)
-    text = re.sub(r"(?<!\w)[→←↑↓](?!\w)", " ", text)  # directional arrows stay stripped, not meaningful as list markers
+
+    # Split concatenated tokens (camelCase, digits+letters)
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", text)
+
+    # Strip long IDs and repeated dates
+    text = re.sub(r"\b\d{6,}\b", " ", text)              # remove long IDs
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", text)   # remove YYYY-MM-DD
+    text = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\d{1,2}\d{4}\b", " ", text)
+
+    # Remove XBRL/us-gaap tags and URLs
+    text = re.sub(r"https?://\S+|//fasb\.org/\S+", " ", text)
+
+    # Drop ticker prefixes and "Member"/boolean noise
+    text = re.sub(r"\b\w+:", " ", text)
+    text = re.sub(r"\b(Member|true|false)\b", " ", text, flags=re.IGNORECASE)
+
+    # Remove boilerplate phrases
+    for b in _BOILERPLATE:
+        text = re.sub(b, " ", text, flags=re.IGNORECASE)
+
+    # Collapse whitespace
     return re.sub(r"\s+", " ", text).strip()
+
+
 
 
 def strip_corp(name: str) -> str:
@@ -304,21 +327,70 @@ def is_junk_chunk(text: str) -> bool:
     return False
 
 
-def dedup(chunks: list) -> list:
-    seen, out = set(), []
-    for c in chunks:
-        words = c["content"].split()
-        if len(words) <= 20:
-            fp = " ".join(words)  # too short to skip a prefix — fingerprint the whole thing
+def clean_chunk_for_embedding(text: str) -> str:
+    # Normalize pipes and spacing
+    text = re.sub(r"\|+", " | ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+
+    # Remove inline footnote markers like (a), (f), etc.
+    text = re.sub(r"\([a-z]\)", " ", text, flags=re.IGNORECASE)
+
+    # Normalize currency and placeholders
+    text = re.sub(r"\$\s*:\s*—", "$0", text)   # replace "$ : —" with "$0"
+    text = re.sub(r"—", "0", text)             # replace em-dash placeholders with 0
+
+    # Normalize numbers in parentheses (negative values)
+    text = re.sub(r"\(([\d,]+)\)", r"-\1", text)
+
+    # Add commas to plain numbers
+    def add_commas(match):
+        num = match.group(0)
+        return f"{int(num):,}"
+    text = re.sub(r"\b\d{5,}\b", add_commas, text)
+
+    # Split concatenated tokens
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", text)
+
+    # Convert table rows into readable sentences
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        parts = [p.strip() for p in line.split(":") if p.strip()]
+        if len(parts) >= 2:
+            out.append(" : ".join(parts))
         else:
-            body_start = min(20, len(words))
-            fp = " ".join(words[body_start:body_start+80])
-        if fp not in seen:
-            seen.add(fp)
+            out.append(line.strip())
+    return " ".join(out).strip()
+
+
+def dedup(chunks: list, similarity_threshold=0.95) -> list:
+    seen_hashes = {}   # hash → list of fp_texts
+    out = []
+
+    for c in chunks:
+        cleaned_chunk = clean_chunk_for_embedding(c["content"])
+        fp_text = cleaned_chunk[:200]  # first 200 chars for fingerprint
+
+        # fast exact duplicate check
+        h = hashlib.sha256(fp_text.encode("utf-8")).hexdigest()
+
+        duplicate = False
+        if h in seen_hashes:
+            # only run fuzzy check against texts with same hash bucket
+            for s in seen_hashes[h]:
+                if difflib.SequenceMatcher(None, fp_text, s).ratio() > similarity_threshold:
+                    duplicate = True
+                    break
+
+        if not duplicate:
+            seen_hashes.setdefault(h, []).append(fp_text)
+            c["content"] = cleaned_chunk
             out.append(c)
+
     removed = len(chunks) - len(out)
     if removed:
-        log.info(f"dedup: removed {removed} chunks")
+        log.info(f"dedup: removed {removed} chunks (threshold {similarity_threshold})")
     return out
 
 
@@ -372,45 +444,14 @@ def tag_section(text: str, form_type: str = "", source_type: str = "") -> str:
     if source_type == "price_history":  return "price_history"
     if source_type == "fundamentals":   return "fundamentals"
     if source_type == "computed_metrics": return "computed_metrics"
+
     return "general"
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# financial intelligence layer
-#
-# this is the biggest thing missing from your current pipeline.
+# financial intelligence layer:-
+# this is the biggest thing missing in our pipeline.
 # bloomberg doesn't ask the llm what the gross margin is.
 # bloomberg computes it in python and hands it to the llm as fact.
-#
-# structure:
-#   financial_history[ticker] = {
-#       "revenue":          {"2025-09-28": 94930000000, "2024-09-28": 90753000000, ...},
-#       "gross_profit":     {...},
-#       "operating_income": {...},
-#       "net_income":       {...},
-#       "eps_basic":        {...},
-#       "free_cash_flow":   {...},
-#       "total_assets":     {...},
-#       "total_debt":       {...},
-#       "equity":           {...},
-#   }
-#
-#   computed[ticker] = {
-#       "gross_margin_latest":        47.2,
-#       "operating_margin_latest":    31.4,
-#       "net_margin_latest":          24.6,
-#       "revenue_yoy":                {"2025":  7.4, "2024": 2.0, ...},
-#       "gross_profit_yoy":           {...},
-#       "operating_income_yoy":       {...},
-#       "revenue_cagr_3y":            4.1,
-#       "revenue_cagr_5y":            8.2,
-#       "eps_growth_yoy":             {...},
-#       "roe":                        1.47,
-#       "roa":                        0.28,
-#       "debt_to_equity":             1.52,
-#       "current_ratio":              0.87,
-#       "fcf_growth_yoy":             {...},
-#   }
 # ──────────────────────────────────────────────────────────────────────────────
 
 CANONICAL_FIELD_MAP = {
@@ -857,8 +898,7 @@ def get_sector_context(ticker: str, sector: str = None, industry: str = None,
  
  
 # ══════════════════════════════════════════════════════════════════════════
-# build_company_health() — REPLACE existing function with this sector-aware
-# version. Signature changes: now takes sector_ctx.
+# build_company_health()
 # ══════════════════════════════════════════════════════════════════════════
  
 HEALTH_SCORE_WEIGHTS = {
@@ -973,13 +1013,13 @@ def build_company_health(metrics: dict, sector_ctx: dict,
  
  
 # ══════════════════════════════════════════════════════════════════════════
-# 1. Capital allocation — add dilution and dividend-history signals
+# 1. Capital allocation — added dilution and dividend-history signals
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Still Version 1 — WACC, cost of debt, interest rates, and full acquisition
 # strategy need external data (rates) or unstructured extraction
 # (M&A intent from filings/calls) that isn't wired up yet. What IS available
-# cheaply from data you already pull: buyback trend from the cash flow
+# cheaply from data is already pulled: buyback trend from the cash flow
 # statement, and current dividend yield/payout ratio from fundamentals.
 # Adding those closes the biggest gap without inventing anything.
  
@@ -2658,7 +2698,7 @@ def expand_query_for_bm25(query: str) -> List[str]:
 # classify() and automatically benefits from the fallback.
 # ══════════════════════════════════════════════════════════════════════════
 
-# 3-5 representative example QUESTIONS per class (full sentences, not
+# 3-5 QUESTIONS per class (full sentences, not
 # keywords). Paraphrases of these get caught through embedding similarity
 # without needing to enumerate every possible wording.
 _CLASS_EXAMPLES = {
@@ -3076,7 +3116,14 @@ def strip_boilerplate_sentences(sents: list) -> list:
 
 def build_chunks(text, company, ticker, form_type, filed_date, url,
                  stype=None, target_words=400, min_quality=0.15):
-    sents  = strip_boilerplate_sentences(split_sentences(text))
+    
+    cleaned_text = clean(text)
+
+    # 👀 Inspection step — see the cleaned text
+    #log.info("\n=== CLEANED TEXT ===")
+    #log.info(cleaned_text[:1000])  # show first 1000 characters
+    #log.info("====================================")
+    sents  = strip_boilerplate_sentences(split_sentences(cleaned_text))
     out    = []
     buf    = []
     buf_n  = 0
@@ -3158,6 +3205,16 @@ _RSS = {
     "cnbc_earnings": "https://www.cnbc.com/id/15839135/device/rss/rss.html",
 }
 
+def make_news_cid(ticker: str, source: str, url: str, title: str) -> str:
+    """
+    Stable ID for a news article.
+
+    Same article + same source + same URL/title => same chunk_id
+    across every refresh, so Supabase upsert does not create duplicates.
+    """
+    raw = f"{ticker}|{source}|{url.strip()}|{title.strip().lower()}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+    return f"{ticker}_news_{digest}"
 
 def fetch_rss(ticker: str, company: str) -> list:
     t     = re.sub(r"\.(NS|BO)|(-USD)|(=F)", "", ticker)
@@ -3194,6 +3251,7 @@ def fetch_rss(ticker: str, company: str) -> list:
                 sec       = tag_section(f"{ct} {cs}", source_type="news")
                 body      = f"{company} news ({lbl}): {ct}. {cs[:300] if cs else ''}. source: {name}. published: {pub}."
                 result.append({
+                    "chunk_id"   : make_news_cid(ticker, name, link, title),
                     "content"    : body,
                     "source_type": f"{name}_news",
                     "ticker"     : ticker,
@@ -3202,7 +3260,14 @@ def fetch_rss(ticker: str, company: str) -> list:
                     "word_count" : len(body.split()),
                     "language"   : "en",
                     "quality"    : chunk_quality(body),
-                    "metadata"   : {"sentiment_label":lbl,"confidence":conf,"source":name,"url":link,"relevance":rel,"section":sec},
+                    "metadata"   : {
+                        "sentiment_label": lbl,
+                        "confidence": conf,
+                        "source": name,
+                        "url": link,
+                        "relevance": rel,
+                        "section": sec,
+                    },
                 })
             log.info(f"rss/{name}: {len(result)} relevant")
             return result
@@ -3279,12 +3344,18 @@ def fetch_newsapi(ticker: str, company: str) -> dict:
         h, d      = a.get("title",""), a.get("description","")
         lbl, conf = finbert(f"{clean(h)}. {clean(d)}")
         articles.append({
-            "title"          : clean(h),
-            "description"    : clean(d),
-            "source"         : a.get("source",{}).get("name",""),
-            "published_at"   : a.get("publishedAt",""),
-            "url"            : a.get("url",""),
-            "sentiment"      : conf,
+            "chunk_id": make_news_cid(
+                ticker,
+                a.get("source", {}).get("name", "newsapi"),
+                a.get("url", ""),
+                h
+            ),
+            "title": clean(h),
+            "description": clean(d),
+            "source": a.get("source", {}).get("name", ""),
+            "published_at": a.get("publishedAt", ""),
+            "url": a.get("url", ""),
+            "sentiment": conf,
             "sentiment_label": lbl,
         })
 
@@ -4246,10 +4317,9 @@ def refresh_news(ticker: str):
             if not a.get("title"): continue
             body = (f"{company} news ({a['sentiment_label']}): {a['title']}. "
                     f"{a.get('description','')}. source: {a.get('source','')}.")
-            counter[0] += 1
             all_news.append({
-                "chunk_id"   : make_cid(ticker,"news",counter[0]),
-                "content"    : body,"source_type":"news","ticker":ticker,
+                "chunk_id": a["chunk_id"],
+                "content": body,
                 "company"    : company,"date":a.get("published_at",""),
                 "word_count" : len(body.split()),"language":"en",
                 "quality"    : chunk_quality(body),
@@ -4257,9 +4327,6 @@ def refresh_news(ticker: str):
             })
 
         rss = fetch_rss(ticker, company)
-        for c in rss:
-            counter[0] += 1
-            c["chunk_id"] = make_cid(ticker, c.get("source_type","rss_news"), counter[0])
         all_news.extend(rss)
 
         if all_news:
@@ -4367,7 +4434,7 @@ def start_scheduler(tickers: List[str]):
 # ──────────────────────────────────────────────────────────────────────────────
 # retrieval layer
 #
-# key changes vs previous version:
+# key changes that I did:
 #   1. computed_metrics chunk is always injected first for financial queries
 #   2. section exclusions prevent risk_factors from competing with financials
 #   3. section preferences boost the right chunks before reranking
@@ -4502,7 +4569,7 @@ def hybrid_search(query: str, ticker: str, chunks: list,query_analysis: dict,k: 
         if 0 <= i < len(chunks):
             scores[i] *= 0.85 + chunks[i].get("quality",0.5) * 0.15
 
-    # ── step 5: force computed_metrics into pool before scoring (fix 4) ──────
+    # ── step 5: force computed_metrics into pool before scoring  ──────
     # previously computed_metrics was only injected AFTER reranking (in
     # ensure_metrics_chunk). if the embedding similarity was low it never
     # entered the candidate pool at all — so ensure_metrics_chunk never ran.
@@ -4533,7 +4600,7 @@ def hybrid_search(query: str, ticker: str, chunks: list,query_analysis: dict,k: 
 
         # ------------------------------------------------------------
         # IMPORTANT:
-        # Do NOT multiply the score repeatedly for every matching rule.
+        # We not multiply the score repeatedly for every matching rule.
         # We use small additive adjustments instead.
         # ------------------------------------------------------------
 
@@ -4615,7 +4682,7 @@ def hybrid_search(query: str, ticker: str, chunks: list,query_analysis: dict,k: 
             scores[i] = age_boost(c.get("date", ""), scores[i])
 
         # ------------------------------------------------------------
-        # Apply ONE bounded adjustment.
+        # Applying ONE bounded adjustment.
         # This prevents score explosion.
         # ------------------------------------------------------------
         scores[i] = scores[i] + adjustment
@@ -4645,7 +4712,7 @@ def hybrid_search(query: str, ticker: str, chunks: list,query_analysis: dict,k: 
         })
 
     # ── step 8: pre-rerank diversity ──────────────────────────────────────────
-    # threshold raised from 0.82 → 0.88 (fix 8).
+    # threshold raised from 0.82 → 0.88.
     # 0.82 was too aggressive — quarterly chunks that legitimately start
     # similarly ("Salesforce Q1 quarterly income...", "Salesforce Q2 quarterly
     # income...") were being collapsed into one, giving the reranker only
@@ -4655,7 +4722,7 @@ def hybrid_search(query: str, ticker: str, chunks: list,query_analysis: dict,k: 
     # entirely — we WANT multiple quarterly period chunks and similarity
     # filtering is the exact wrong thing to do for those queries.
     if trend_q:
-        # no diversity filtering — keep all quarterly period chunks
+        # no diversity filtering — keeping all quarterly period chunks
         pass
     elif len(candidates) > k:
         # threshold 0.88 (was 0.82), also enforce minimum floor of k//2
@@ -4694,7 +4761,7 @@ def rerank(query: str, ranked: list, query_analysis: dict, top_n: int = 10,
 
     # bge-reranker-large's CrossEncoder.predict() already applies sigmoid
     # internally (num_labels=1 config) — rsc is already a bounded [0,1]
-    # relevance probability. Do NOT transform it again; that's what was
+    # relevance probability. We NOT transform it again; that's what was
     # crushing all scores into a narrow band near 0.5.
     norm = list(rsc)
 
@@ -4788,7 +4855,7 @@ def rerank(query: str, ranked: list, query_analysis: dict, top_n: int = 10,
         multiplier = 0.7 + 0.6 * qual   # maps [0,1] → [0.7,1.3]
         score *= multiplier
 
-        # clamp the boosted score before blending so a long multiplier chain
+        # clamping the boosted score before blending so a long multiplier chain
         # can't let final_score be dominated by stacked boosts rather than
         # actual rerank relevance
         score = min(score, 2.0)
@@ -5490,7 +5557,7 @@ def compare(query: str, tickers: List[str], chunks_map: Dict[str,list],
                  "compare using the data above — same metrics, same periods where possible. "
                  "note data gaps. cite with [TICKER-SOURCE N].")
 
-    # build the dynamic system prompt — checks what data is actually
+    # builded the dynamic system prompt — checks what data is actually
     # available across ALL compared tickers combined, and frames using
     # the first ticker's sector (cross-sector comparisons only get one
     # sector's framing right now, a known limitation)
@@ -5561,7 +5628,7 @@ def run_query(query: str, ticker: str, company: str, chunks: list,
     print(f"chunks selected  : {len(results)}")
 
     print("-" * 100)
-
+    """
     for i, r in enumerate(results, 1):
         metadata = r.get("metadata", {})
 
@@ -5596,7 +5663,7 @@ def run_query(query: str, ticker: str, company: str, chunks: list,
         print()
 
     print("=" * 100)
-"""
+
 
     results = diversity_filter(results, chunks)
     results = filter_boilerplate(results, chunks)
