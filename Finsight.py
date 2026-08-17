@@ -1,6 +1,6 @@
 # finsight.py
-#
 # bloomberg-style financial research pipeline
+# making the work easy for financial people by providing the instant reading of majority of financial docs
 
 import feedparser
 import html
