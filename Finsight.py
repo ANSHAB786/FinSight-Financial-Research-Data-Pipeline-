@@ -1,7 +1,8 @@
 # finsight.py
-# bloomberg-style financial research pipeline
-# making the work easy for financial people by providing the instant reading of majority of financial docs
-
+# I TRIED TO ENHANCE MY PIPELINE AS MUCH AS POSSIBLE AND I WILL UPDATE IT AS I SEE FIT IN IT
+# I HAVE TESTED IT IN ON MULTIPLE QUERIES IT WILL 90% TIME PROVIDE IN CORRECT FORMAT AND SOMETIMES
+# IT'S JUST BUILD UP ITS OWN NUMBERS WHICH IT CLEARLY STATE IT AT THE END. YUP, SO I AM IMPROVING IT BY CLEANING PROPERLY AT THE DATA
+# FETCH STAGE AS IT'S THE GOLDEN AREA. 
 import feedparser
 import html
 import logging
